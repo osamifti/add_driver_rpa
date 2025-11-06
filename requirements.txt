@@ -1,0 +1,12 @@
+# FastAPI and web framework dependencies
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# Selenium and browser automation
+selenium==4.25.0
+
+# Additional utilities
+python-multipart==0.0.9
+aiofiles==24.1.0
+
