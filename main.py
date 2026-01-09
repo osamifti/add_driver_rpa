@@ -239,13 +239,13 @@ def get_next_debug_port() -> int:
         return assigned_port
 
 
-def setup_chrome_driver(debug_port: Optional[int] = None, username: Optional[str] = None):
+def setup_chrome_driver(debug_port: Optional[int] = None, thread_id: Optional[int] = None):
     """
     Configure and initialize Chrome WebDriver with appropriate options.
     
     Args:
         debug_port: Optional remote debugging port. If not provided, a unique port will be assigned.
-        username: Optional username to use for profile directory. If provided, same username will reuse same profile.
+        thread_id: Optional thread ID to use for profile directory. Each thread maintains its own session.
     
     Returns:
         webdriver.Chrome: Configured Chrome WebDriver instance
@@ -253,8 +253,9 @@ def setup_chrome_driver(debug_port: Optional[int] = None, username: Optional[str
     Note:
         - Runs in headless mode (browser window will not be visible)
         - Uses persistent Chrome profiles to maintain login sessions (no repeated OTPs)
-        - Profiles are based on username to preserve sessions across requests
-        - Each concurrent browser gets its own profile directory (based on username + debug port)
+        - Profiles are based on thread_id - each thread saves and loads its own session independently
+        - When a thread closes, it saves its session to its own profile
+        - When a thread reopens (reuses thread_id), it loads from its saved session
         - Disables GPU and sandbox for compatibility
         - Sets download directory for PDF files
         - Each browser instance gets a unique remote debugging port
@@ -289,68 +290,27 @@ def setup_chrome_driver(debug_port: Optional[int] = None, username: Optional[str
     # Add logging for debugging
     print(f"🔧 Initializing Chrome WebDriver in headless mode (debug port: {debug_port})...")
     
-    # Set up persistent Chrome profile to avoid repeated OTP authentication
-    # Use username-based profiles to preserve sessions across requests
+    # Set up persistent Chrome profile based on thread_id
+    # Each thread maintains its own session independently
     chrome_profiles_dir = os.path.join(os.getcwd(), "chrome_profiles")
     os.makedirs(chrome_profiles_dir, exist_ok=True)
     
-    # Create profile directory based on username + debug_port to allow concurrent browsers
-    # Each concurrent browser gets its own profile to avoid Chrome profile locking
-    # But we'll copy session data from base profile if it exists
-    if username:
-        # Sanitize username for use in directory name (remove special characters)
-        safe_username = re.sub(r'[^a-zA-Z0-9_-]', '_', username)
-        # Base profile directory (for session persistence)
-        base_profile_dir = os.path.join(chrome_profiles_dir, f"user_{safe_username}")
-        # Current profile directory (username + debug_port for concurrent access)
-        profile_dir = os.path.join(chrome_profiles_dir, f"user_{safe_username}_{debug_port}")
+    # Create profile directory based on thread_id
+    # Each thread gets its own profile and saves/loads its own session
+    if thread_id is not None:
+        profile_dir = os.path.join(chrome_profiles_dir, f"thread_{thread_id}")
     else:
-        # Fallback to debug port only if no username provided
-        base_profile_dir = None
+        # Fallback to debug port only if no thread_id provided
         profile_dir = os.path.join(chrome_profiles_dir, f"profile_{debug_port}")
     
     os.makedirs(profile_dir, exist_ok=True)
     
-    # If base profile exists and current profile is new/empty, copy session data
-    # This allows concurrent browsers while preserving login sessions
-    if username and base_profile_dir != profile_dir and os.path.exists(base_profile_dir):
-        base_default_profile = os.path.join(base_profile_dir, "Default")
-        current_default_profile = os.path.join(profile_dir, "Default")
-        
-        # Check if we need to copy session data (if current profile is new or empty)
-        if not os.path.exists(current_default_profile) or not os.listdir(current_default_profile):
-            print(f"📋 Copying session data from base profile to allow concurrent access...")
-            try:
-                # Copy cookies and session storage
-                if os.path.exists(base_default_profile):
-                    # Copy specific session files
-                    session_files = [
-                        "Cookies",
-                        "Cookies-journal",
-                        "Local Storage",
-                        "Session Storage",
-                        "Preferences",
-                        "Login Data",
-                        "Login Data-journal"
-                    ]
-                    
-                    os.makedirs(current_default_profile, exist_ok=True)
-                    
-                    for session_file in session_files:
-                        source_path = os.path.join(base_default_profile, session_file)
-                        dest_path = os.path.join(current_default_profile, session_file)
-                        
-                        if os.path.exists(source_path):
-                            if os.path.isdir(source_path):
-                                if os.path.exists(dest_path):
-                                    shutil.rmtree(dest_path)
-                                shutil.copytree(source_path, dest_path)
-                            else:
-                                shutil.copy2(source_path, dest_path)
-                    
-                    print(f"✅ Session data copied successfully")
-            except Exception as e:
-                print(f"⚠️ Could not copy session data: {str(e)} - continuing with new profile")
+    # Check if this thread already has a saved session
+    default_profile = os.path.join(profile_dir, "Default")
+    if os.path.exists(default_profile) and os.listdir(default_profile):
+        print(f"📂 Loading existing session for Thread-{thread_id}")
+    else:
+        print(f"🆕 Creating new session for Thread-{thread_id}")
     
     # Configure Chrome to use the persistent profile
     chrome_options.add_argument(f"--user-data-dir={profile_dir}")
@@ -378,10 +338,47 @@ def setup_chrome_driver(debug_port: Optional[int] = None, username: Optional[str
     driver.implicitly_wait(5)  # Reduced from 10 to 5 for faster startup
     
     print(f"✅ Chrome WebDriver initialized successfully (debug port: {debug_port})")
+    
+    # Store profile info in driver for later session saving
+    driver._profile_info = {
+        "profile_dir": profile_dir,
+        "thread_id": thread_id
+    }
+    
     return driver
 
 
 
+
+
+def wait_for_session_save(driver):
+    """
+    Wait for Chrome to finish saving session data to the profile directory.
+    Chrome automatically saves session data when the browser closes.
+    Each thread maintains its own session in its own profile directory.
+    
+    Args:
+        driver: Chrome WebDriver instance with _profile_info attribute
+    """
+    try:
+        if not hasattr(driver, '_profile_info'):
+            return
+        
+        profile_info = driver._profile_info
+        thread_id = profile_info.get("thread_id")
+        
+        if thread_id is not None:
+            print(f"💾 Waiting for Chrome to save session data for Thread-{thread_id}...")
+        
+        # Wait for Chrome to finish writing session data to profile directory
+        # Chrome automatically saves cookies, localStorage, etc. when browser closes
+        time.sleep(2)
+        
+        if thread_id is not None:
+            print(f"✅ Session data saved for Thread-{thread_id}")
+        
+    except Exception as e:
+        print(f"⚠️ Error waiting for session save: {str(e)}")
 
 
 def get_next_thread_id() -> int:
@@ -712,8 +709,8 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
         # STEP 1: Initialize WebDriver
         # -------------------------------------------------------------------------
         log_thread(thread_id, "🔧 Initializing Chrome WebDriver...")
-        # Pass username to setup_chrome_driver to use username-based profiles for session persistence
-        driver = setup_chrome_driver(username=request.username)
+        # Pass thread_id to setup_chrome_driver - each thread maintains its own session
+        driver = setup_chrome_driver(thread_id=thread_id)
         
         # Update thread status
         with browser_threads_lock:
@@ -3069,6 +3066,13 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             
             log_thread(thread_id, "📦 Preparing to send response to client...")
             
+            # Save session data to base profile before closing browser
+            if driver:
+                try:
+                    wait_for_session_save(driver)
+                except Exception as e:
+                    log_thread(thread_id, f"⚠️  Warning: Error saving session: {str(e)}")
+            
             # Close browser before returning response to avoid hanging
             if driver:
                 try:
@@ -4990,6 +4994,11 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
         
         log_thread(thread_id, "📦 Preparing to send response to client...")
         
+        # Wait for Chrome to finish saving session data
+        # Chrome automatically saves to the thread's profile directory
+        if driver:
+            wait_for_session_save(driver)
+        
         # Close browser before returning response to avoid hanging
         if driver:
             try:
@@ -5017,6 +5026,10 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
                 browser_threads[thread_id]["status"] = "timeout_error"
         if driver:
             try:
+                save_session_to_base_profile(driver)
+            except:
+                pass
+            try:
                 driver.quit()
             except:
                 pass
@@ -5034,6 +5047,10 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             if thread_id in browser_threads:
                 browser_threads[thread_id]["status"] = "element_not_found_error"
         if driver:
+            try:
+                save_session_to_base_profile(driver)
+            except:
+                pass
             try:
                 driver.quit()
             except:
@@ -5053,6 +5070,10 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
                 browser_threads[thread_id]["status"] = "error"
                 browser_threads[thread_id]["error"] = str(e)
         if driver:
+            try:
+                save_session_to_base_profile(driver)
+            except:
+                pass
             try:
                 driver.quit()
             except:
