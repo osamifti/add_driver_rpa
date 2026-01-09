@@ -42,6 +42,11 @@ otp_waiting_lock = threading.Lock()
 thread_counter = 0
 thread_counter_lock = threading.Lock()
 
+# Available thread IDs for reuse - when threads finish, their IDs become available again
+# Supports N number of concurrent threads dynamically
+available_thread_ids = set()
+available_thread_ids_lock = threading.Lock()
+
 # Thread ID to browser mapping for logging purposes
 browser_threads: Dict[int, dict] = {}
 browser_threads_lock = threading.Lock()
@@ -326,16 +331,25 @@ def setup_chrome_driver(debug_port: Optional[int] = None):
 def get_next_thread_id() -> int:
     """
     Get the next unique thread ID for a browser instance.
-    Each browser gets a unique thread ID for tracking and OTP queue management.
+    Reuses any available thread ID when threads finish (supports N concurrent threads).
+    This ensures OTP matching works correctly by reusing thread IDs efficiently.
     
     Returns:
-        int: Unique thread ID for the browser instance
+        int: Unique thread ID for the browser instance (reused if available, otherwise new)
     """
     global thread_counter
     
-    with thread_counter_lock:
-        thread_counter += 1
-        thread_id = thread_counter
+    # First, try to reuse an available thread ID (any ID that was previously used)
+    with available_thread_ids_lock:
+        if available_thread_ids:
+            # Reuse the lowest available thread ID
+            thread_id = min(available_thread_ids)
+            available_thread_ids.remove(thread_id)
+        else:
+            # No available IDs, create a new one by incrementing counter
+            with thread_counter_lock:
+                thread_counter += 1
+                thread_id = thread_counter
     
     # Register this thread in the browser_threads mapping
     with browser_threads_lock:
@@ -345,6 +359,29 @@ def get_next_thread_id() -> int:
         }
     
     return thread_id
+
+
+def release_thread_id(thread_id: int):
+    """
+    Release a thread ID back to the available pool when a thread finishes.
+    This allows any thread ID to be reused for new requests (supports N concurrent threads).
+    
+    Args:
+        thread_id: The thread ID to release
+    """
+    # Release any thread ID back to the available pool for reuse
+    with available_thread_ids_lock:
+        available_thread_ids.add(thread_id)
+    
+    # Remove from browser_threads mapping
+    with browser_threads_lock:
+        if thread_id in browser_threads:
+            del browser_threads[thread_id]
+    
+    # Remove from OTP waiting threads if still there
+    with otp_waiting_lock:
+        if thread_id in otp_waiting_threads:
+            otp_waiting_threads.remove(thread_id)
 
 
 def log_thread(thread_id: int, message: str):
@@ -1356,6 +1393,9 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
         
         print("Looking for date input field...")
         
+        # Track whether date was successfully entered
+        date_entered = False
+        
         # Determine which date field to use based on action type
         if "driver" in action_type_lower:
             # Use date_to_add_driver for both "add driver" and "update driver" actions
@@ -1394,25 +1434,31 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             # Wait a moment for the field to register
             time.sleep(2)
             
+            # Verify date was entered
+            entered_date = date_input_field.get_attribute('value')
+            if entered_date:
+                date_entered = True
+                print(f"✅ Date successfully entered: {entered_date}")
+            else:
+                print("⚠️ Date field is empty after entry attempt")
+            
             print(f"After date entry - Title: {driver.title}")
             print(f"After date entry - URL: {driver.current_url}")
             
         except TimeoutException:
-            print("Could not find effective date input field")
-            if "driver" in action_type_lower:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Effective date input field not found on driver page"
-                )
-            else:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Effective date input field not found on vehicle page"
-                )
+            print("⚠️ Could not find effective date input field - continuing to next step")
+            # Don't stop the bot - just skip this step and continue
+            # The date field might not be required in all scenarios
+            date_entered = False
         
         # -------------------------------------------------------------------------
         # STEP 10: Select the first option from the requester type dropdown
         # -------------------------------------------------------------------------
+        
+        # If date was skipped, wait a bit longer for page to be ready
+        if not date_entered:
+            print("⚠️ Date was skipped - waiting extra time for page to be ready...")
+            time.sleep(5)  # Increased wait time when date is skipped
         
         print("Looking for requester type dropdown...")
         
@@ -1423,32 +1469,200 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             )
             print("Found requester type dropdown")
             
+            # Check if dropdown is enabled before trying to select
+            is_enabled = requester_dropdown.is_enabled()
+            if not is_enabled:
+                print("⚠️ Requester dropdown is disabled - waiting for it to become enabled...")
+                # Wait for dropdown to become enabled
+                WebDriverWait(driver, 10).until(
+                    lambda d: requester_dropdown.is_enabled()
+                )
+                print("✅ Requester dropdown is now enabled")
+            
             # Scroll to the dropdown with extra offset to avoid sticky headers
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", requester_dropdown)
             time.sleep(1)
             
-            # Use JavaScript click to avoid interception by sticky headers
-            driver.execute_script("arguments[0].focus();", requester_dropdown)
-            driver.execute_script("arguments[0].click();", requester_dropdown)
-            time.sleep(1)
+            # IMPORTANT: Click the dropdown first to trigger option loading (especially when date is skipped)
+            print("Clicking dropdown to load options...")
+            try:
+                # Try clicking with Selenium first
+                requester_dropdown.click()
+                time.sleep(1)
+            except Exception as e:
+                print(f"⚠️ Regular click failed: {str(e)} - trying JavaScript click...")
+                # Fallback to JavaScript click
+                driver.execute_script("arguments[0].focus(); arguments[0].click();", requester_dropdown)
+                time.sleep(1)
             
-            # Use JavaScript to set the value and trigger change events (more reliable for Angular)
-            first_option_value = "I~Quoc Ho"  # First option value
-            driver.execute_script("""
-                var select = arguments[0];
-                select.value = arguments[1];
-                select.dispatchEvent(new Event('change', { bubbles: true }));
-                select.dispatchEvent(new Event('input', { bubbles: true }));
-                select.dispatchEvent(new Event('blur', { bubbles: true }));
-            """, requester_dropdown, first_option_value)
+            # Wait for options to be loaded after clicking
+            print("Waiting for dropdown options to load after click...")
+            time.sleep(2)
             
-            print(f"Selected first option: Named insured - Quoc Ho (value: {first_option_value})")
+            # Wait for options to appear and select the second option (index 1)
+            # NOTE: First option (index 0) is always empty, so we select the second option (index 1)
+            print("Waiting for options to appear...")
+            max_retries = 5
+            retry_count = 0
+            selected_option_value = None
+            selected_option_text = None
+            second_option = None
             
-            # Verify selection
-            selected_value = requester_dropdown.get_attribute('value')
-            print(f"Verified selected value: {selected_value}")
+            while retry_count < max_retries and not second_option:
+                # Get all options
+                all_options = requester_dropdown.find_elements(By.TAG_NAME, "option")
+                print(f"Found {len(all_options)} total options in dropdown")
+                
+                # Check if we have at least 2 options
+                if len(all_options) >= 2:
+                    # Select the second option (index 1) directly
+                    second_option = all_options[1]
+                    selected_option_value = second_option.get_attribute('value')
+                    selected_option_text = second_option.text.strip()
+                    
+                    # Log all options for debugging
+                    for i, option in enumerate(all_options):
+                        opt_value = option.get_attribute('value')
+                        opt_text = option.text.strip()
+                        print(f"Option {i}: value='{opt_value}', text='{opt_text}'")
+                    
+                    print(f"✅ Selected second option (index 1): text='{selected_option_text}', value='{selected_option_value}'")
+                    break
+                else:
+                    retry_count += 1
+                    print(f"⚠️ Not enough options found (need at least 2, found {len(all_options)}) - attempt {retry_count}/{max_retries}")
+                    # Click again to ensure dropdown is open
+                    driver.execute_script("arguments[0].click();", requester_dropdown)
+                    time.sleep(1)
             
-            # Wait a moment for the selection to register
+            if not second_option:
+                raise Exception(f"Could not find second option in requester dropdown. Found {len(all_options) if 'all_options' in locals() else 0} options")
+            
+            # If value is empty, try selecting by index instead
+            if not selected_option_value or not selected_option_value.strip():
+                print("⚠️ Second option has no value - will select by index instead")
+                selected_option_value = None  # Will use index-based selection
+            
+            # Use Selenium Select class for more reliable dropdown selection
+            select = Select(requester_dropdown)
+            
+            # Try to select by index (index 1 = second option) or by value
+            try:
+                if selected_option_value and selected_option_value.strip():
+                    # Try selecting by value first
+                    select.select_by_value(selected_option_value)
+                    print(f"✅ Selected option using Select.select_by_value: {selected_option_text} (value: {selected_option_value})")
+                else:
+                    # Select by index (second option = index 1)
+                    select.select_by_index(1)
+                    print(f"✅ Selected second option using Select.select_by_index(1): {selected_option_text}")
+            except Exception as e:
+                print(f"⚠️ Select method failed: {str(e)} - trying JavaScript method...")
+                # Fallback to JavaScript - select by index
+                driver.execute_script("""
+                    var select = arguments[0];
+                    var index = arguments[1];
+                    select.selectedIndex = index;
+                    // Trigger all necessary events for Angular
+                    var changeEvent = new Event('change', { bubbles: true, cancelable: true });
+                    select.dispatchEvent(changeEvent);
+                    var inputEvent = new Event('input', { bubbles: true, cancelable: true });
+                    select.dispatchEvent(inputEvent);
+                    var blurEvent = new Event('blur', { bubbles: true, cancelable: true });
+                    select.dispatchEvent(blurEvent);
+                """, requester_dropdown, 1)
+                time.sleep(1)
+            
+            # Verify selection actually worked using JavaScript to avoid stale element issues
+            time.sleep(2)  # Give it time to update
+            
+            # Use JavaScript to get selected values to avoid stale element references
+            try:
+                verification_result = driver.execute_script("""
+                    var select = document.querySelector("select[data-pgr-id='ddlTranRequesterTypeCode']");
+                    if (!select) return {error: "Dropdown not found"};
+                    return {
+                        selectedIndex: select.selectedIndex,
+                        selectedValue: select.value,
+                        selectedText: select.options[select.selectedIndex] ? select.options[select.selectedIndex].text.trim() : ""
+                    };
+                """)
+                
+                selected_index = verification_result.get('selectedIndex')
+                selected_value = verification_result.get('selectedValue', '')
+                selected_text = verification_result.get('selectedText', '')
+                
+                print(f"Verified selected index: {selected_index}")
+                print(f"Verified selected value: {selected_value}")
+                if selected_text:
+                    print(f"Verified selected text: {selected_text}")
+                
+                # Verify that index 1 is selected (second option)
+                if selected_index is not None and int(selected_index) == 1:
+                    print(f"✅ Selection verified successfully: Index 1 selected (value: {selected_value}, text: {selected_text})")
+                elif selected_option_value and selected_value == selected_option_value:
+                    print(f"✅ Selection verified successfully: {selected_option_text} (value: {selected_value})")
+                else:
+                    print(f"⚠️ Selection verification - index: {selected_index}, value: {selected_value}, expected value: {selected_option_value}")
+                    # Try one more time with JavaScript - select by index
+                    print("Retrying selection with enhanced JavaScript (by index)...")
+                    driver.execute_script("""
+                        var select = document.querySelector("select[data-pgr-id='ddlTranRequesterTypeCode']");
+                        if (select) {
+                            // Clear first
+                            select.selectedIndex = -1;
+                            // Set index
+                            select.selectedIndex = 1;
+                            // Trigger comprehensive events
+                            ['change', 'input', 'blur', 'focus'].forEach(function(eventType) {
+                                var event = new Event(eventType, { bubbles: true, cancelable: true });
+                                select.dispatchEvent(event);
+                            });
+                        }
+                    """)
+                    time.sleep(2)
+                    
+                    # Verify again
+                    verification_result = driver.execute_script("""
+                        var select = document.querySelector("select[data-pgr-id='ddlTranRequesterTypeCode']");
+                        if (!select) return {error: "Dropdown not found"};
+                        return {
+                            selectedIndex: select.selectedIndex,
+                            selectedValue: select.value,
+                            selectedText: select.options[select.selectedIndex] ? select.options[select.selectedIndex].text.trim() : ""
+                        };
+                    """)
+                    
+                    selected_index = verification_result.get('selectedIndex')
+                    selected_value = verification_result.get('selectedValue', '')
+                    print(f"After retry - verified selected index: {selected_index}, value: {selected_value}")
+                    
+                    if selected_index is not None and int(selected_index) != 1:
+                        print(f"⚠️ Selection verification - expected index 1, got index {selected_index}")
+                        print("⚠️ Continuing despite selection verification issue...")
+                    else:
+                        print(f"✅ Selection verified after retry: Index {selected_index} selected")
+                        
+            except StaleElementReferenceException:
+                print("⚠️ Stale element reference during verification - using JavaScript instead...")
+                # Re-find dropdown and verify using JavaScript
+                verification_result = driver.execute_script("""
+                    var select = document.querySelector("select[data-pgr-id='ddlTranRequesterTypeCode']");
+                    if (!select) return {error: "Dropdown not found"};
+                    return {
+                        selectedIndex: select.selectedIndex,
+                        selectedValue: select.value,
+                        selectedText: select.options[select.selectedIndex] ? select.options[select.selectedIndex].text.trim() : ""
+                    };
+                """)
+                selected_index = verification_result.get('selectedIndex')
+                selected_value = verification_result.get('selectedValue', '')
+                print(f"✅ Verified via JavaScript - Index: {selected_index}, Value: {selected_value}")
+            except Exception as e:
+                print(f"⚠️ Error during verification: {str(e)} - continuing anyway...")
+                # Don't fail the entire process if verification has issues
+            
+            # Wait a moment for the selection to register with the page
             time.sleep(2)
             
             print(f"After dropdown selection - Title: {driver.title}")
@@ -1910,46 +2124,84 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             print("Looking for driver years licensed range dropdown...")
             
             try:
-                # Find the dropdown by its data-pgr-id attribute
-                years_licensed_dropdown = extended_wait.until(
+                # Wait for dropdown to be present
+                extended_wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "select[data-pgr-id='ddlDriverYearsLicensedRange']"))
                 )
                 print("Found driver years licensed range dropdown")
                 
-                # Scroll to the dropdown with extra offset to avoid sticky headers
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", years_licensed_dropdown)
-                time.sleep(1)
-                
-                # Use JavaScript click to open the dropdown (same pattern as requester dropdown)
-                driver.execute_script("arguments[0].focus();", years_licensed_dropdown)
-                driver.execute_script("arguments[0].click();", years_licensed_dropdown)
-                time.sleep(1)
-                
-                # Select "3 years or more" option (value='3') using JavaScript
-                # Use document.querySelector to avoid stale element references
+                # Use JavaScript for all operations to avoid stale element references
                 three_years_value = "3"
+                
+                # Scroll, click, and select all using JavaScript
                 driver.execute_script("""
                     var select = document.querySelector("select[data-pgr-id='ddlDriverYearsLicensedRange']");
                     if (select) {
-                        select.value = arguments[0];
-                        select.dispatchEvent(new Event('change', { bubbles: true }));
-                        select.dispatchEvent(new Event('input', { bubbles: true }));
-                        select.dispatchEvent(new Event('blur', { bubbles: true }));
+                        // Scroll into view
+                        select.scrollIntoView({block: 'center', behavior: 'smooth'});
+                        // Focus and click to open dropdown
+                        select.focus();
+                        select.click();
+                        // Small delay for dropdown to open
+                        setTimeout(function() {
+                            // Select the value
+                            select.value = arguments[0];
+                            // Trigger all necessary events for Angular
+                            var changeEvent = new Event('change', { bubbles: true, cancelable: true });
+                            select.dispatchEvent(changeEvent);
+                            var inputEvent = new Event('input', { bubbles: true, cancelable: true });
+                            select.dispatchEvent(inputEvent);
+                            var blurEvent = new Event('blur', { bubbles: true, cancelable: true });
+                            select.dispatchEvent(blurEvent);
+                        }, 500);
                     }
                 """, three_years_value)
                 
-                print(f"Selected '3 years or more' option (value: {three_years_value})")
-                
-                # Wait a moment for the selection to register
+                # Wait for JavaScript to execute and selection to register
                 time.sleep(2)
                 
-                # Verify selection - re-find element to avoid stale reference
+                print(f"Selected '3 years or more' option (value: {three_years_value})")
+                
+                # Verify selection using JavaScript to avoid stale element references
                 try:
-                    years_licensed_dropdown = driver.find_element(By.CSS_SELECTOR, "select[data-pgr-id='ddlDriverYearsLicensedRange']")
-                    selected_value = years_licensed_dropdown.get_attribute('value')
+                    verification_result = driver.execute_script("""
+                        var select = document.querySelector("select[data-pgr-id='ddlDriverYearsLicensedRange']");
+                        if (!select) return {error: "Dropdown not found"};
+                        return {
+                            selectedValue: select.value,
+                            selectedIndex: select.selectedIndex,
+                            selectedText: select.options[select.selectedIndex] ? select.options[select.selectedIndex].text.trim() : ""
+                        };
+                    """)
+                    
+                    selected_value = verification_result.get('selectedValue', '')
+                    selected_index = verification_result.get('selectedIndex')
+                    selected_text = verification_result.get('selectedText', '')
+                    
                     print(f"Verified selected value: {selected_value}")
-                except (StaleElementReferenceException, Exception) as e:
-                    print(f"Could not verify selection (element may have been updated): {e}")
+                    if selected_index is not None:
+                        print(f"Verified selected index: {selected_index}")
+                    if selected_text:
+                        print(f"Verified selected text: {selected_text}")
+                    
+                    # If selection didn't work, try again with direct value setting
+                    if selected_value != three_years_value:
+                        print(f"⚠️ Selection mismatch - expected '{three_years_value}', got '{selected_value}' - retrying...")
+                        driver.execute_script("""
+                            var select = document.querySelector("select[data-pgr-id='ddlDriverYearsLicensedRange']");
+                            if (select) {
+                                select.value = arguments[0];
+                                ['change', 'input', 'blur'].forEach(function(eventType) {
+                                    var event = new Event(eventType, { bubbles: true, cancelable: true });
+                                    select.dispatchEvent(event);
+                                });
+                            }
+                        """, three_years_value)
+                        time.sleep(1)
+                        print("Retried selection")
+                        
+                except Exception as e:
+                    print(f"⚠️ Could not verify selection: {e} - continuing anyway")
                     # Selection likely succeeded, continue anyway
                 
                 print(f"After years licensed selection - Title: {driver.title}")
@@ -2321,6 +2573,10 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             # STEP 27: Click "View upcoming payments" link and scrape payment schedule
             # -------------------------------------------------------------------------
             
+            # Initialize payment schedule variables in case link is not found
+            payment_schedule = []
+            installment_fee_note = "Not found"
+            
             print("Looking for 'View upcoming payments' link...")
             
             try:
@@ -2416,21 +2672,32 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
                 print("=" * 60)
                 
             except TimeoutException:
-                print("Could not find 'View upcoming payments' link or payment schedule table")
-                raise HTTPException(
-                    status_code=404,
-                    detail="View upcoming payments link or payment schedule table not found"
-                )
+                print("⚠️ Could not find 'View upcoming payments' link or payment schedule table - skipping this step")
+                # Set empty payment schedule and continue
+                payment_schedule = []
+                installment_fee_note = "Not found"
+                print("=" * 60)
+                print("⚠️ Step 27 skipped - payment schedule not available")
+                print("=" * 60)
             except Exception as e:
-                print(f"Error scraping payment schedule: {str(e)}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error scraping payment schedule: {str(e)}"
-                )
+                print(f"⚠️ Error scraping payment schedule: {str(e)} - skipping this step")
+                # Set empty payment schedule and continue
+                payment_schedule = []
+                installment_fee_note = "Not found"
+                print("=" * 60)
+                print("⚠️ Step 27 skipped - payment schedule not available")
+                print("=" * 60)
             
             # -------------------------------------------------------------------------
             # STEP 28: Click "effect on rate for the entire policy period" link and scrape coverage comparison data
             # -------------------------------------------------------------------------
+            
+            # Initialize effect on rate data in case link is not found
+            effect_on_rate_data = {
+                "vehicle_summary": [],
+                "total_policy_rate": {},
+                "vehicle_details": []
+            }
             
             print("Looking for 'effect on rate for the entire policy period' link...")
             
@@ -2624,17 +2891,15 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
                 print("=" * 60)
                 
             except TimeoutException:
-                print("Could not find 'effect on rate for the entire policy period' link or modal")
-                raise HTTPException(
-                    status_code=404,
-                    detail="Effect on rate link or modal not found"
-                )
+                print("⚠️ Could not find 'effect on rate for the entire policy period' link or modal - skipping this step")
+                print("=" * 60)
+                print("⚠️ Step 28 skipped - effect on rate data not available")
+                print("=" * 60)
             except Exception as e:
-                print(f"Error scraping effect on rate data: {str(e)}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error scraping effect on rate data: {str(e)}"
-                )
+                print(f"⚠️ Error scraping effect on rate data: {str(e)} - skipping this step")
+                print("=" * 60)
+                print("⚠️ Step 28 skipped - effect on rate data not available")
+                print("=" * 60)
             
             # -------------------------------------------------------------------------
             # STEP 29: Click "Save this update for later" checkbox
@@ -2758,6 +3023,9 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             log_thread(thread_id, "=" * 60)
             log_thread(thread_id, "✅ Sending response to client")
             log_thread(thread_id, "=" * 60)
+            
+            # Release thread ID for reuse
+            release_thread_id(thread_id)
             
             # Return scraped data
             return response_data
@@ -4235,6 +4503,10 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
         # STEP 40: Click "View upcoming payments" link and scrape payment schedule
         # -------------------------------------------------------------------------
         
+        # Initialize payment schedule variables in case link is not found
+        payment_schedule = []
+        installment_fee_note = "Not found"
+        
         print("Looking for 'View upcoming payments' link...")
         
         try:
@@ -4330,21 +4602,32 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             print("=" * 60)
             
         except TimeoutException:
-            print("Could not find 'View upcoming payments' link or payment schedule table")
-            raise HTTPException(
-                status_code=404,
-                detail="View upcoming payments link or payment schedule table not found"
-            )
+            print("⚠️ Could not find 'View upcoming payments' link or payment schedule table - skipping this step")
+            # Set empty payment schedule and continue
+            payment_schedule = []
+            installment_fee_note = "Not found"
+            print("=" * 60)
+            print("⚠️ Step 40 skipped - payment schedule not available")
+            print("=" * 60)
         except Exception as e:
-            print(f"Error scraping payment schedule: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error scraping payment schedule: {str(e)}"
-            )
+            print(f"⚠️ Error scraping payment schedule: {str(e)} - skipping this step")
+            # Set empty payment schedule and continue
+            payment_schedule = []
+            installment_fee_note = "Not found"
+            print("=" * 60)
+            print("⚠️ Step 40 skipped - payment schedule not available")
+            print("=" * 60)
         
         # -------------------------------------------------------------------------
         # STEP 41: Click "effect on rate for the entire policy period" link and scrape coverage comparison data
         # -------------------------------------------------------------------------
+        
+        # Initialize effect on rate data in case link is not found
+        effect_on_rate_data = {
+            "vehicle_summary": [],
+            "total_policy_rate": {},
+            "vehicle_details": []
+        }
         
         print("Looking for 'effect on rate for the entire policy period' link...")
         
@@ -4538,17 +4821,15 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             print("=" * 60)
             
         except TimeoutException:
-            print("Could not find 'effect on rate for the entire policy period' link or modal")
-            raise HTTPException(
-                status_code=404,
-                detail="Effect on rate link or modal not found"
-            )
+            print("⚠️ Could not find 'effect on rate for the entire policy period' link or modal - skipping this step")
+            print("=" * 60)
+            print("⚠️ Step 41 skipped - effect on rate data not available")
+            print("=" * 60)
         except Exception as e:
-            print(f"Error scraping effect on rate data: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Error scraping effect on rate data: {str(e)}"
-            )
+            print(f"⚠️ Error scraping effect on rate data: {str(e)} - skipping this step")
+            print("=" * 60)
+            print("⚠️ Step 41 skipped - effect on rate data not available")
+            print("=" * 60)
         
         # -------------------------------------------------------------------------
         # STEP 42: Click "Save this update for later" checkbox
@@ -4664,6 +4945,9 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
         log_thread(thread_id, "✅ Sending response to client")
         log_thread(thread_id, "=" * 60)
         
+        # Release thread ID for reuse
+        release_thread_id(thread_id)
+        
         # Return scraped data
         return response_data
         
@@ -4678,6 +4962,8 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
                 driver.quit()
             except:
                 pass
+        # Release thread ID for reuse
+        release_thread_id(thread_id)
         raise HTTPException(
             status_code=408,
             detail=f"Timeout waiting for page elements: {str(e)}"
@@ -4694,6 +4980,8 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
                 driver.quit()
             except:
                 pass
+        # Release thread ID for reuse
+        release_thread_id(thread_id)
         raise HTTPException(
             status_code=404,
             detail=f"Required element not found: {str(e)}"
@@ -4711,6 +4999,8 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
                 driver.quit()
             except:
                 pass
+        # Release thread ID for reuse
+        release_thread_id(thread_id)
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred: {str(e)}"
