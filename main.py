@@ -1676,7 +1676,7 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             )
         
         # -------------------------------------------------------------------------
-        # STEP 11: Enter the agent contact name
+        # STEP 11: Enter the agent contact nam
         # -------------------------------------------------------------------------
         
         print("Looking for agent contact name input field...")
@@ -1709,6 +1709,7 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
             time.sleep(2)
             
             print(f"After agent name entry - Title: {driver.title}")
+
             print(f"After agent name entry - URL: {driver.current_url}")
             
         except TimeoutException:
