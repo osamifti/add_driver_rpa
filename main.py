@@ -26,6 +26,7 @@ from pathlib import Path
 import json
 import threading
 import queue
+import shutil
 from typing import Dict, Optional
 
 # Thread-safe OTP queue system for multi-threaded browser instances
@@ -238,12 +239,13 @@ def get_next_debug_port() -> int:
         return assigned_port
 
 
-def setup_chrome_driver(debug_port: Optional[int] = None):
+def setup_chrome_driver(debug_port: Optional[int] = None, username: Optional[str] = None):
     """
     Configure and initialize Chrome WebDriver with appropriate options.
     
     Args:
         debug_port: Optional remote debugging port. If not provided, a unique port will be assigned.
+        username: Optional username to use for profile directory. If provided, same username will reuse same profile.
     
     Returns:
         webdriver.Chrome: Configured Chrome WebDriver instance
@@ -251,7 +253,8 @@ def setup_chrome_driver(debug_port: Optional[int] = None):
     Note:
         - Runs in headless mode (browser window will not be visible)
         - Uses persistent Chrome profiles to maintain login sessions (no repeated OTPs)
-        - Each concurrent browser gets its own profile directory
+        - Profiles are based on username to preserve sessions across requests
+        - Each concurrent browser gets its own profile directory (based on username + debug port)
         - Disables GPU and sandbox for compatibility
         - Sets download directory for PDF files
         - Each browser instance gets a unique remote debugging port
@@ -287,14 +290,67 @@ def setup_chrome_driver(debug_port: Optional[int] = None):
     print(f"🔧 Initializing Chrome WebDriver in headless mode (debug port: {debug_port})...")
     
     # Set up persistent Chrome profile to avoid repeated OTP authentication
-    # Each thread gets its own profile directory to avoid conflicts
+    # Use username-based profiles to preserve sessions across requests
     chrome_profiles_dir = os.path.join(os.getcwd(), "chrome_profiles")
     os.makedirs(chrome_profiles_dir, exist_ok=True)
     
-    # Create a unique profile directory for this debug port
-    # This ensures each concurrent browser has its own profile
-    profile_dir = os.path.join(chrome_profiles_dir, f"profile_{debug_port}")
+    # Create profile directory based on username + debug_port to allow concurrent browsers
+    # Each concurrent browser gets its own profile to avoid Chrome profile locking
+    # But we'll copy session data from base profile if it exists
+    if username:
+        # Sanitize username for use in directory name (remove special characters)
+        safe_username = re.sub(r'[^a-zA-Z0-9_-]', '_', username)
+        # Base profile directory (for session persistence)
+        base_profile_dir = os.path.join(chrome_profiles_dir, f"user_{safe_username}")
+        # Current profile directory (username + debug_port for concurrent access)
+        profile_dir = os.path.join(chrome_profiles_dir, f"user_{safe_username}_{debug_port}")
+    else:
+        # Fallback to debug port only if no username provided
+        base_profile_dir = None
+        profile_dir = os.path.join(chrome_profiles_dir, f"profile_{debug_port}")
+    
     os.makedirs(profile_dir, exist_ok=True)
+    
+    # If base profile exists and current profile is new/empty, copy session data
+    # This allows concurrent browsers while preserving login sessions
+    if username and base_profile_dir != profile_dir and os.path.exists(base_profile_dir):
+        base_default_profile = os.path.join(base_profile_dir, "Default")
+        current_default_profile = os.path.join(profile_dir, "Default")
+        
+        # Check if we need to copy session data (if current profile is new or empty)
+        if not os.path.exists(current_default_profile) or not os.listdir(current_default_profile):
+            print(f"📋 Copying session data from base profile to allow concurrent access...")
+            try:
+                # Copy cookies and session storage
+                if os.path.exists(base_default_profile):
+                    # Copy specific session files
+                    session_files = [
+                        "Cookies",
+                        "Cookies-journal",
+                        "Local Storage",
+                        "Session Storage",
+                        "Preferences",
+                        "Login Data",
+                        "Login Data-journal"
+                    ]
+                    
+                    os.makedirs(current_default_profile, exist_ok=True)
+                    
+                    for session_file in session_files:
+                        source_path = os.path.join(base_default_profile, session_file)
+                        dest_path = os.path.join(current_default_profile, session_file)
+                        
+                        if os.path.exists(source_path):
+                            if os.path.isdir(source_path):
+                                if os.path.exists(dest_path):
+                                    shutil.rmtree(dest_path)
+                                shutil.copytree(source_path, dest_path)
+                            else:
+                                shutil.copy2(source_path, dest_path)
+                    
+                    print(f"✅ Session data copied successfully")
+            except Exception as e:
+                print(f"⚠️ Could not copy session data: {str(e)} - continuing with new profile")
     
     # Configure Chrome to use the persistent profile
     chrome_options.add_argument(f"--user-data-dir={profile_dir}")
@@ -656,7 +712,8 @@ def run_automation_sync(request: PolicyRequest, thread_id: int):
         # STEP 1: Initialize WebDriver
         # -------------------------------------------------------------------------
         log_thread(thread_id, "🔧 Initializing Chrome WebDriver...")
-        driver = setup_chrome_driver()
+        # Pass username to setup_chrome_driver to use username-based profiles for session persistence
+        driver = setup_chrome_driver(username=request.username)
         
         # Update thread status
         with browser_threads_lock:
