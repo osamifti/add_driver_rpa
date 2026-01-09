@@ -49,3 +49,8 @@ Thumbs.db
 .env
 .env.local
 
+# Chrome persistent profiles (contains session data)
+chrome_profiles/
+
+# Downloads directory
+downloads/

@@ -24,8 +24,33 @@ import re
 import asyncio
 from pathlib import Path
 import json
+import threading
+import queue
+from typing import Dict, Optional
 
-# Global variable to store OTP
+# Thread-safe OTP queue system for multi-threaded browser instances
+# OTPs are distributed in FIFO order: first OTP goes to first browser, second OTP to second browser, etc.
+otp_queue = queue.Queue()
+otp_queue_lock = threading.Lock()
+
+# Thread registration system to ensure proper FIFO ordering
+# Threads register when they start waiting, and OTPs are distributed based on registration order
+otp_waiting_threads = []  # List of thread IDs waiting for OTP in order
+otp_waiting_lock = threading.Lock()
+
+# Thread counter for assigning unique thread IDs to each browser instance
+thread_counter = 0
+thread_counter_lock = threading.Lock()
+
+# Thread ID to browser mapping for logging purposes
+browser_threads: Dict[int, dict] = {}
+browser_threads_lock = threading.Lock()
+
+# Port counter for unique remote debugging ports (each browser needs unique port)
+debug_port_counter = 9222
+debug_port_lock = threading.Lock()
+
+# Legacy global OTP storage for backward compatibility (kept for safety)
 otp_storage = {"otp": None, "timestamp": None}
 
 # Initialize FastAPI app
@@ -180,19 +205,57 @@ class PolicyRequest(BaseModel):
     bodily_injury_property_damage: str = Field(default="", description="Bodily injury and property damage liability: Split limits like '$100,000 each person/$300,000 each accident/$100,000 each accident' or combined single limits like '$300,000 combined single limit' (required for vehicle actions)")
 
 
-def setup_chrome_driver():
+def get_next_debug_port() -> int:
+    """
+    Get the next available remote debugging port for a browser instance.
+    Each browser needs a unique port to avoid conflicts.
+    
+    Returns:
+        int: Unique remote debugging port number
+    """
+    global debug_port_counter
+    
+    with debug_port_lock:
+        debug_port_counter += 1
+        # Use ports starting from 9223 (9222 is often used by default Chrome instances)
+        # Incrementing for each browser to ensure uniqueness
+        # Limit to reasonable range (9223-9999)
+        if debug_port_counter < 9223:
+            debug_port_counter = 9223  # Start from 9223
+        if debug_port_counter > 9999:
+            debug_port_counter = 9223  # Reset if we exceed range (ports should be freed by then)
+        
+        assigned_port = debug_port_counter
+        
+        # No delay - browsers should open instantly
+        # Chrome handles port assignment internally, no need for artificial delay
+        
+        return assigned_port
+
+
+def setup_chrome_driver(debug_port: Optional[int] = None):
     """
     Configure and initialize Chrome WebDriver with appropriate options.
+    
+    Args:
+        debug_port: Optional remote debugging port. If not provided, a unique port will be assigned.
     
     Returns:
         webdriver.Chrome: Configured Chrome WebDriver instance
         
     Note:
-        - Runs in headless mode (browser window not visible)
+        - Runs in headless mode (browser window will not be visible)
+        - Uses persistent Chrome profiles to maintain login sessions (no repeated OTPs)
+        - Each concurrent browser gets its own profile directory
         - Disables GPU and sandbox for compatibility
         - Sets download directory for PDF files
+        - Each browser instance gets a unique remote debugging port
     """
     chrome_options = Options()
+    
+    # Get unique debug port for this browser instance
+    if debug_port is None:
+        debug_port = get_next_debug_port()
     
     # Headless mode ENABLED - browser window will not be visible
     chrome_options.add_argument("--headless=new")
@@ -203,16 +266,41 @@ def setup_chrome_driver():
     chrome_options.add_argument("--disable-software-rasterizer")
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--disable-setuid-sandbox")
-    chrome_options.add_argument("--remote-debugging-port=9222")
+    chrome_options.add_argument(f"--remote-debugging-port={debug_port}")
+    
+    # Additional options to speed up browser startup
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--disable-infobars")
+    chrome_options.add_argument("--disable-logging")
+    chrome_options.add_argument("--log-level=3")  # Suppress most logs
+    chrome_options.add_argument("--silent")
+    chrome_options.add_argument("--disable-background-timer-throttling")
+    chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_options.add_argument("--disable-renderer-backgrounding")
     
     # Add logging for debugging
-    print("🔧 Initializing Chrome WebDriver in headless mode...")
+    print(f"🔧 Initializing Chrome WebDriver in headless mode (debug port: {debug_port})...")
+    
+    # Set up persistent Chrome profile to avoid repeated OTP authentication
+    # Each thread gets its own profile directory to avoid conflicts
+    chrome_profiles_dir = os.path.join(os.getcwd(), "chrome_profiles")
+    os.makedirs(chrome_profiles_dir, exist_ok=True)
+    
+    # Create a unique profile directory for this debug port
+    # This ensures each concurrent browser has its own profile
+    profile_dir = os.path.join(chrome_profiles_dir, f"profile_{debug_port}")
+    os.makedirs(profile_dir, exist_ok=True)
+    
+    # Configure Chrome to use the persistent profile
+    chrome_options.add_argument(f"--user-data-dir={profile_dir}")
+    # Use a specific profile name to avoid conflicts
+    chrome_options.add_argument("--profile-directory=Default")
+    
+    print(f"📁 Using persistent Chrome profile: {profile_dir}")
     
     # Set download directory
     download_dir = os.path.join(os.getcwd(), "downloads")
     os.makedirs(download_dir, exist_ok=True)
-    
-
     
     # Configure download preferences
     prefs = {
@@ -223,43 +311,234 @@ def setup_chrome_driver():
     }
     chrome_options.add_experimental_option("prefs", prefs)
     
-    # Initialize driver
+    # Initialize driver (this is the blocking operation - runs in thread pool)
+    # Using a shorter implicit wait to speed up initialization
     driver = webdriver.Chrome(options=chrome_options)
-    driver.implicitly_wait(10)
+    driver.implicitly_wait(5)  # Reduced from 10 to 5 for faster startup
     
-    print("✅ Chrome WebDriver initialized successfully")
+    print(f"✅ Chrome WebDriver initialized successfully (debug port: {debug_port})")
     return driver
 
 
 
 
 
-async def wait_for_otp_from_api(timeout=120):
+def get_next_thread_id() -> int:
+    """
+    Get the next unique thread ID for a browser instance.
+    Each browser gets a unique thread ID for tracking and OTP queue management.
+    
+    Returns:
+        int: Unique thread ID for the browser instance
+    """
+    global thread_counter
+    
+    with thread_counter_lock:
+        thread_counter += 1
+        thread_id = thread_counter
+    
+    # Register this thread in the browser_threads mapping
+    with browser_threads_lock:
+        browser_threads[thread_id] = {
+            "created_at": time.time(),
+            "status": "initializing"
+        }
+    
+    return thread_id
+
+
+def log_thread(thread_id: int, message: str):
+    """
+    Log a message with thread ID prefix for easy tracking.
+    
+    Args:
+        thread_id: The thread ID of the browser instance
+        message: The log message to print
+    """
+    print(f"[Thread-{thread_id}] {message}")
+
+
+async def wait_for_otp_from_api(timeout=120, thread_id: Optional[int] = None):
     """
     Wait for OTP to be sent via API endpoint (async version).
-    Returns the OTP code or None if timeout.
+    Uses queue-based system for multi-browser support with proper FIFO ordering.
     
-    This is async to avoid blocking the server while waiting for OTP.
+    Args:
+        timeout: Maximum time to wait for OTP in seconds (default: 120)
+        thread_id: Thread ID of the browser instance waiting for OTP.
+                   If provided, uses queue-based FIFO distribution.
+                   If None, falls back to legacy global storage.
+    
+    Returns:
+        str or None: The OTP code if received, None if timeout
+        
+    Note:
+        - In multi-browser mode (thread_id provided), waits for OTP from queue (FIFO)
+        - Uses blocking queue.get() with timeout to ensure proper FIFO ordering
+        - In single-request mode (thread_id is None), uses legacy global otp_storage
+        - This is async to avoid blocking the server while waiting for OTP
     """
-    print(f"⏳ Waiting for OTP via API endpoint (timeout: {timeout}s)...")
+    if thread_id is not None:
+        # Multi-browser mode: use queue-based FIFO distribution
+        # Register this thread as waiting for OTP (ensures FIFO order)
+        with otp_waiting_lock:
+            if thread_id not in otp_waiting_threads:
+                otp_waiting_threads.append(thread_id)
+                wait_position = len(otp_waiting_threads)
+            else:
+                wait_position = otp_waiting_threads.index(thread_id) + 1
+        
+        # Update thread status to indicate waiting for OTP
+        with browser_threads_lock:
+            if thread_id in browser_threads:
+                browser_threads[thread_id]["status"] = "waiting_for_otp"
+        
+        log_thread(thread_id, f"⏳ Waiting for OTP from queue (timeout: {timeout}s, position: {wait_position})...")
+        
+        # Calculate remaining time for each blocking call
+        start_time = time.time()
+        remaining_timeout = timeout
+        
+        # Helper function for blocking queue.get() to ensure proper FIFO ordering
+        def get_otp_blocking(timeout_sec: float):
+            """Blocking queue.get() - ensures threads wait in FIFO order"""
+            return otp_queue.get(timeout=timeout_sec)
+        
+        while remaining_timeout > 0:
+            try:
+                # Check if there's an OTP available AND this thread is next in line (FIFO order)
+                with otp_waiting_lock:
+                    has_otp = otp_queue.qsize() > 0
+                    is_my_turn = len(otp_waiting_threads) > 0 and otp_waiting_threads[0] == thread_id
+                
+                if has_otp and is_my_turn:
+                    # This thread is next AND there's an OTP available
+                    # Use blocking queue.get() with timeout
+                    block_timeout = min(0.3, remaining_timeout)
+                    otp_code = await asyncio.to_thread(get_otp_blocking, block_timeout)
+                    
+                    # IMMEDIATELY remove this thread from waiting list
+                    with otp_waiting_lock:
+                        if thread_id in otp_waiting_threads:
+                            otp_waiting_threads.remove(thread_id)
+                    
+                    log_thread(thread_id, f"✅ OTP received from queue: {otp_code}")
+                    return otp_code
+                else:
+                    # Either no OTP available OR not this thread's turn yet
+                    # Wait a bit and check again
+                    await asyncio.sleep(0.1)
+                    remaining_timeout = timeout - (time.time() - start_time)
+                    if remaining_timeout <= 0:
+                        break
+                    continue
+                    
+            except queue.Empty:
+                # Timeout on this iteration, check if we should continue
+                remaining_timeout = timeout - (time.time() - start_time)
+                if remaining_timeout <= 0:
+                    break
+                # Continue waiting immediately - queue.get() already waited
+                continue
+            except Exception as e:
+                log_thread(thread_id, f"⚠️ Error waiting for OTP: {str(e)}")
+                # On error, check remaining time and continue
+                remaining_timeout = timeout - (time.time() - start_time)
+                if remaining_timeout <= 0:
+                    break
+                await asyncio.sleep(0.05)  # Very small delay before retry
+                continue
+        
+        # Remove thread from waiting list on timeout
+        with otp_waiting_lock:
+            if thread_id in otp_waiting_threads:
+                otp_waiting_threads.remove(thread_id)
+        
+        log_thread(thread_id, "❌ OTP timeout - no OTP received from queue within timeout period")
+        return None
+    else:
+        # Legacy single-request mode: use global storage
+        print(f"⏳ Waiting for OTP via API endpoint (timeout: {timeout}s)...")
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if otp_storage["otp"] is not None:
+                # Check if OTP is not too old (within 5 minutes)
+                if time.time() - otp_storage["timestamp"] < 300:  # 5 minutes
+                    otp_code = otp_storage["otp"]
+                    otp_storage["otp"] = None  # Clear after use
+                    print(f"✅ OTP received: {otp_code}")
+                    return otp_code
+                else:
+                    print("⚠️ OTP expired, clearing...")
+                    otp_storage["otp"] = None
+            
+            # Use asyncio.sleep instead of time.sleep to not block the event loop
+            await asyncio.sleep(1)
+        
+        print("❌ OTP timeout - no OTP received within timeout period")
+        return None
+
+
+def wait_for_otp_sync(timeout: int, thread_id: int):
+    """
+    Synchronous version of OTP waiting for use in thread pool.
+    This function runs in a dedicated thread so blocking operations are OK.
+    
+    Args:
+        timeout: Maximum time to wait for OTP in seconds
+        thread_id: Thread ID of the browser instance waiting for OTP
+    
+    Returns:
+        str or None: The OTP code if received, None if timeout
+    """
+    # Register this thread as waiting for OTP (ensures FIFO order)
+    with otp_waiting_lock:
+        if thread_id not in otp_waiting_threads:
+            otp_waiting_threads.append(thread_id)
+            wait_position = len(otp_waiting_threads)
+        else:
+            wait_position = otp_waiting_threads.index(thread_id) + 1
+    
+    # Update thread status to indicate waiting for OTP
+    with browser_threads_lock:
+        if thread_id in browser_threads:
+            browser_threads[thread_id]["status"] = "waiting_for_otp"
+    
+    log_thread(thread_id, f"⏳ Waiting for OTP from queue (timeout: {timeout}s, position: {wait_position})...")
     
     start_time = time.time()
     while time.time() - start_time < timeout:
-        if otp_storage["otp"] is not None:
-            # Check if OTP is not too old (within 5 minutes)
-            if time.time() - otp_storage["timestamp"] < 300:  # 5 minutes
-                otp_code = otp_storage["otp"]
-                otp_storage["otp"] = None  # Clear after use
-                print(f"✅ OTP received: {otp_code}")
-                return otp_code
-            else:
-                print("⚠️ OTP expired, clearing...")
-                otp_storage["otp"] = None
+        # Check if there's an OTP available AND this thread is next in line
+        with otp_waiting_lock:
+            has_otp = otp_queue.qsize() > 0
+            is_my_turn = len(otp_waiting_threads) > 0 and otp_waiting_threads[0] == thread_id
         
-        # Use asyncio.sleep instead of time.sleep to not block the event loop
-        await asyncio.sleep(1)
+        if has_otp and is_my_turn:
+            try:
+                # Get OTP from queue with short timeout
+                otp_code = otp_queue.get(timeout=0.3)
+                
+                # IMMEDIATELY remove this thread from waiting list
+                with otp_waiting_lock:
+                    if thread_id in otp_waiting_threads:
+                        otp_waiting_threads.remove(thread_id)
+                
+                log_thread(thread_id, f"✅ OTP received from queue: {otp_code}")
+                return otp_code
+            except queue.Empty:
+                # No OTP available yet, continue waiting
+                pass
+        
+        # Wait a bit before checking again (OK to block - we're in a thread)
+        time.sleep(0.1)
     
-    print("❌ OTP timeout - no OTP received within timeout period")
+    # Remove thread from waiting list on timeout
+    with otp_waiting_lock:
+        if thread_id in otp_waiting_threads:
+            otp_waiting_threads.remove(thread_id)
+    
+    log_thread(thread_id, "❌ OTP timeout - no OTP received from queue within timeout period")
     return None
 
 
@@ -321,105 +600,38 @@ async def otp_info():
     }
 
 
-@app.post("/start")
-async def retrieve_policy(request: PolicyRequest):
+def run_automation_sync(request: PolicyRequest, thread_id: int):
     """
-    Main endpoint to start the bot and navigate to policy details page.
-    
-    Supports multiple action types:
-    - 'add driver': Add a new driver to the policy
-    - 'update driver': Update an existing driver on the policy
-    - 'add vehical': Add a new vehicle to the policy
-    - 'replace vehical': Replace an existing vehicle on the policy
+    Synchronous automation function that runs in a thread pool.
+    This allows multiple browser instances to run concurrently without blocking each other.
     
     Args:
-        request: PolicyRequest containing:
-            - username, password, policy_no, agent_name (required for all actions)
-            - action_type: 'add driver', 'update driver', 'add vehical', or 'replace vehical'
-            - date_to_add_driver: Required for 'add driver' actions
-            - date_to_rep_vehical: Required for vehicle actions
-            - Vehicle-specific fields: Required only for vehicle actions (vehical_year, make, model, etc.)
-        
-    Returns:
-        dict: Success response with step completion status
-        
-    Raises:
-        HTTPException: If login fails or policy cannot be retrieved
-        
-    Workflow (Steps 1-6 are common for all actions):
-        1. Initialize Selenium WebDriver
-        2. Navigate to Progressive login page
-        3. Fill in credentials and handle OTP if needed
-        4. Select policy search option and enter policy number
-        5. Click search button
-        6. Find and click policy button
-        
-    Workflow for 'add driver' or 'update driver' (Steps 7-30):
-        7. Click on "Drivers" button from dropdown menu
-        8. Click on "Add Driver" or "Update Driver" option from second dropdown
-        9. Enter date for driver action
-        10. Select first option from requester type dropdown
-        11. Enter agent contact name
-        12. Select first option from agent email address dropdown
-        13. Click "Continue" button and wait for new page to load
-        14. Enter driver first name
-        15. Enter driver last name
-        16. Enter driver date of birth
-        17. Select driver gender (Male or Female)
-        18. Select driver marital status (Married or Single)
-        19. Select "Other relation" from relationship dropdown
-        20. Select "3 years or more" from years licensed dropdown
-        21. Click "No" for additional insured indicator
-        22. Click "Continue" button and wait for new page to load
-        23. Click "No" for driver violations
-        24. Mark checkbox
-        25. Click "Continue" button and wait for new page to load
-        26. Scrape final page data (transaction details, premium details)
-        27. Click "View upcoming payments" and scrape payment schedule
-        28. Click "effect on rate" link and scrape coverage comparison data
-        29. Click "Save this update for later" checkbox
-        30. Click final "Continue" button and wait for page to load (BOT ENDS HERE)
-        
-    Workflow for vehicle actions (Steps 7+):
-        7. Click on "Vehicles" button from dropdown menu
-        8. Click on "Replace Vehicle" or "Add a Vehicle" option from second dropdown
-        9. Enter date for vehicle action
-        10. Select first option from requester type dropdown
-        11. Enter agent contact name
-        12. Select first option from agent email address dropdown
-        13. Click "Continue" button and wait for new page to load
-        14. Find and select matching vehicle to replace from list (for replace only)
-        15. Click "Continue" button and wait for new page to load
-        16-43. Additional vehicle-specific steps...
-    """
-    # Log the start of the request
-    print("=" * 80)
-    print("🚀 START ENDPOINT HIT - Beginning policy retrieval process")
-    print("=" * 80)
-    print(f"📋 Policy Number: {request.policy_no}")
-    print(f"👤 Username: {request.username[:3]}***") # Partial for security
-    print(f"🎯 Action Type: {request.action_type}")
-    if "driver" in request.action_type.lower():
-        print(f"📅 Effective Date: {request.date_to_add_driver}")
-    else:
-        if request.vehicle_name_to_replace:
-            print(f"🚗 Existing Vehicle: {request.vehicle_name_to_replace}")
-        else:
-            print(f"🚗 Existing Vehicle: N/A (Add vehicle)")
-        print(f"📅 Effective Date: {request.date_to_rep_vehical}")
-    print("=" * 80)
+        request: PolicyRequest containing all the request data
+        thread_id: Unique thread ID for this browser instance
     
+    Returns:
+        dict: Success response with automation results
+    """
     driver = None
     
     try:
         # -------------------------------------------------------------------------
         # STEP 1: Initialize WebDriver
         # -------------------------------------------------------------------------
+        log_thread(thread_id, "🔧 Initializing Chrome WebDriver...")
         driver = setup_chrome_driver()
+        
+        # Update thread status
+        with browser_threads_lock:
+            if thread_id in browser_threads:
+                browser_threads[thread_id]["status"] = "browser_initialized"
+        
+        log_thread(thread_id, "✅ Chrome WebDriver initialized successfully")
         
         # -------------------------------------------------------------------------
         # STEP 2: Navigate to Progressive login page
         # -------------------------------------------------------------------------
+        log_thread(thread_id, "🌐 Navigating to Progressive login page...")
         login_url = "https://www.foragentsonlylogin.progressive.com/Login/?flowId=5IZypmklew"
         driver.get(login_url)
         
@@ -428,8 +640,8 @@ async def retrieve_policy(request: PolicyRequest):
         time.sleep(3)
         
         # Log current page title for debugging
-        print(f"Page title: {driver.title}")
-        print(f"Current URL: {driver.current_url}")
+        log_thread(thread_id, f"Page title: {driver.title}")
+        log_thread(thread_id, f"Current URL: {driver.current_url}")
         
         # -------------------------------------------------------------------------
         # STEP 3: Fill in login credentials
@@ -441,7 +653,7 @@ async def retrieve_policy(request: PolicyRequest):
         )
         username_field.clear()
         username_field.send_keys(request.username)
-        print(f"Username entered: {request.username}")
+        log_thread(thread_id, f"Username entered: {request.username}")
         
         # Wait for password field to be present and interactable
         password_field = wait.until(
@@ -449,7 +661,7 @@ async def retrieve_policy(request: PolicyRequest):
         )
         password_field.clear()
         password_field.send_keys(request.password)
-        print("Password entered")
+        log_thread(thread_id, "Password entered")
         
         # Wait a moment before clicking login
         time.sleep(1)
@@ -459,13 +671,13 @@ async def retrieve_policy(request: PolicyRequest):
             EC.element_to_be_clickable((By.ID, "image1"))
         )
         login_button.click()
-        print("Login button clicked")
+        log_thread(thread_id, "Login button clicked")
         
         # Wait for login to process and page to load
         time.sleep(8)
         
-        print(f"After login - Page title: {driver.title}")
-        print(f"After login - Current URL: {driver.current_url}")
+        log_thread(thread_id, f"After login - Page title: {driver.title}")
+        log_thread(thread_id, f"After login - Current URL: {driver.current_url}")
         
         # Check if we're on the expected page or if MFA is required
         page_source_snippet = driver.page_source[:500]
@@ -484,14 +696,15 @@ async def retrieve_policy(request: PolicyRequest):
                 otp_field = WebDriverWait(driver, 5).until(
                     EC.presence_of_element_located((By.ID, "reauth-sms-otp-input"))
                 )
-                print("✅ OTP field found - waiting for OTP...")
+                log_thread(thread_id, "✅ OTP field found - waiting for OTP...")
                 otp_field_found = True
                 
-                # Wait for OTP to be entered via API endpoint (async)
-                otp_code = await wait_for_otp_from_api()
+                # Wait for OTP to be entered via API endpoint (synchronous - we're in a thread pool)
+                # Pass thread_id for queue-based OTP distribution
+                otp_code = wait_for_otp_sync(timeout=120, thread_id=thread_id)
                 
                 if otp_code:
-                    print(f"✅ Received OTP: {otp_code}")
+                    log_thread(thread_id, f"✅ Received OTP: {otp_code}")
                     
                     # Wait for OTP field to be clickable and clear it
                     WebDriverWait(driver, 10).until(
@@ -505,7 +718,7 @@ async def retrieve_policy(request: PolicyRequest):
                     driver.execute_script("arguments[0].value = arguments[1];", otp_field, otp_code)
                     driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", otp_field)
                     driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", otp_field)
-                    print(f"✅ Entered OTP: {otp_code}")
+                    log_thread(thread_id, f"✅ Entered OTP: {otp_code}")
                     
                     # Wait a moment for the field to register the input
                     time.sleep(2)
@@ -1628,45 +1841,49 @@ async def retrieve_policy(request: PolicyRequest):
             print("Looking for driver relationship dropdown...")
             
             try:
-                # Find the dropdown by its data-pgr-id attribute
-                relationship_dropdown = extended_wait.until(
+                # Wait for the dropdown to be present
+                extended_wait.until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "select[data-pgr-id='ddlDriverRelationship']"))
                 )
                 print("Found driver relationship dropdown")
                 
-                # Scroll to the dropdown with extra offset to avoid sticky headers
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", relationship_dropdown)
-                time.sleep(1)
-                
-                # Use JavaScript click to open the dropdown (same pattern as requester dropdown)
-                driver.execute_script("arguments[0].focus();", relationship_dropdown)
-                driver.execute_script("arguments[0].click();", relationship_dropdown)
-                time.sleep(1)
-                
-                # Select "Other relation" option (value='O') using JavaScript
-                # Use document.querySelector to avoid stale element references
+                # Use JavaScript to find, scroll, focus, click, and select - all in one to avoid stale element references
                 other_relation_value = "O"
                 driver.execute_script("""
                     var select = document.querySelector("select[data-pgr-id='ddlDriverRelationship']");
                     if (select) {
+                        // Scroll to the dropdown
+                        select.scrollIntoView({block: 'center', behavior: 'smooth'});
+                        
+                        // Focus and click to open the dropdown
+                        select.focus();
+                        select.click();
+                        
+                        // Set the value
                         select.value = arguments[0];
+                        
+                        // Dispatch events to ensure the change is registered
                         select.dispatchEvent(new Event('change', { bubbles: true }));
                         select.dispatchEvent(new Event('input', { bubbles: true }));
                         select.dispatchEvent(new Event('blur', { bubbles: true }));
+                        
+                        return select.value;
                     }
+                    return null;
                 """, other_relation_value)
-                
-                print(f"Selected 'Other relation' option (value: {other_relation_value})")
                 
                 # Wait a moment for the selection to register
                 time.sleep(2)
                 
-                # Verify selection - re-find element to avoid stale reference
+                # Verify selection using JavaScript to avoid stale element references
                 try:
-                    relationship_dropdown = driver.find_element(By.CSS_SELECTOR, "select[data-pgr-id='ddlDriverRelationship']")
-                    selected_value = relationship_dropdown.get_attribute('value')
+                    selected_value = driver.execute_script("""
+                        var select = document.querySelector("select[data-pgr-id='ddlDriverRelationship']");
+                        return select ? select.value : null;
+                    """)
+                    print(f"Selected 'Other relation' option (value: {other_relation_value})")
                     print(f"Verified selected value: {selected_value}")
-                except (StaleElementReferenceException, Exception) as e:
+                except Exception as e:
                     print(f"Could not verify selection (element may have been updated): {e}")
                     # Selection likely succeeded, continue anyway
                 
@@ -2487,12 +2704,17 @@ async def retrieve_policy(request: PolicyRequest):
                 print(f"After final Continue click - URL: {driver.current_url}")
                 
                 print("=" * 60)
-                print("✅ Step 30 completed successfully!")
-                print("✅ Final page loaded - Bot process completed")
-                print("=" * 60)
+                log_thread(thread_id, "✅ Step 30 completed successfully!")
+                log_thread(thread_id, "✅ Final page loaded - Bot process completed")
+                log_thread(thread_id, "=" * 60)
+                
+                # Update thread status
+                with browser_threads_lock:
+                    if thread_id in browser_threads:
+                        browser_threads[thread_id]["status"] = "completed"
                 
             except TimeoutException:
-                print("Could not find final 'Continue' button")
+                log_thread(thread_id, "Could not find final 'Continue' button")
                 raise HTTPException(
                     status_code=404,
                     detail="Final Continue button not found"
@@ -2522,20 +2744,20 @@ async def retrieve_policy(request: PolicyRequest):
                 "effect_on_rate": effect_on_rate_data
             }
             
-            print("📦 Preparing to send response to client...")
+            log_thread(thread_id, "📦 Preparing to send response to client...")
             
             # Close browser before returning response to avoid hanging
             if driver:
                 try:
-                    print("🔧 Closing browser...")
+                    log_thread(thread_id, "🔧 Closing browser...")
                     driver.quit()
-                    print("✅ Browser closed successfully")
+                    log_thread(thread_id, "✅ Browser closed successfully")
                 except Exception as e:
-                    print(f"⚠️  Warning: Error closing browser: {str(e)}")
+                    log_thread(thread_id, f"⚠️  Warning: Error closing browser: {str(e)}")
             
-            print("=" * 60)
-            print("✅ Sending response to client")
-            print("=" * 60)
+            log_thread(thread_id, "=" * 60)
+            log_thread(thread_id, "✅ Sending response to client")
+            log_thread(thread_id, "=" * 60)
             
             # Return scraped data
             return response_data
@@ -4402,10 +4624,15 @@ async def retrieve_policy(request: PolicyRequest):
         # Waiting for further instructions for next steps
         # -------------------------------------------------------------------------
         
-        print("=" * 60)
-        print("✅ Step 43 completed successfully!")
-        print("✅ Clicked final Continue button and waited for page to load")
-        print("=" * 60)
+        log_thread(thread_id, "=" * 60)
+        log_thread(thread_id, "✅ Step 43 completed successfully!")
+        log_thread(thread_id, "✅ Clicked final Continue button and waited for page to load")
+        log_thread(thread_id, "=" * 60)
+        
+        # Update thread status
+        with browser_threads_lock:
+            if thread_id in browser_threads:
+                browser_threads[thread_id]["status"] = "completed"
         
         # Prepare response data before cleanup
         response_data = {
@@ -4422,25 +4649,30 @@ async def retrieve_policy(request: PolicyRequest):
             "effect_on_rate": effect_on_rate_data
         }
         
-        print("📦 Preparing to send response to client...")
+        log_thread(thread_id, "📦 Preparing to send response to client...")
         
         # Close browser before returning response to avoid hanging
         if driver:
             try:
-                print("🔧 Closing browser...")
+                log_thread(thread_id, "🔧 Closing browser...")
                 driver.quit()
-                print("✅ Browser closed successfully")
+                log_thread(thread_id, "✅ Browser closed successfully")
             except Exception as e:
-                print(f"⚠️  Warning: Error closing browser: {str(e)}")
+                log_thread(thread_id, f"⚠️  Warning: Error closing browser: {str(e)}")
         
-        print("=" * 60)
-        print("✅ Sending response to client")
-        print("=" * 60)
+        log_thread(thread_id, "=" * 60)
+        log_thread(thread_id, "✅ Sending response to client")
+        log_thread(thread_id, "=" * 60)
         
         # Return scraped data
         return response_data
         
     except TimeoutException as e:
+        log_thread(thread_id, f"❌ TimeoutException: {str(e)}")
+        # Update thread status
+        with browser_threads_lock:
+            if thread_id in browser_threads:
+                browser_threads[thread_id]["status"] = "timeout_error"
         if driver:
             try:
                 driver.quit()
@@ -4452,6 +4684,11 @@ async def retrieve_policy(request: PolicyRequest):
         )
         
     except NoSuchElementException as e:
+        log_thread(thread_id, f"❌ NoSuchElementException: {str(e)}")
+        # Update thread status
+        with browser_threads_lock:
+            if thread_id in browser_threads:
+                browser_threads[thread_id]["status"] = "element_not_found_error"
         if driver:
             try:
                 driver.quit()
@@ -4463,11 +4700,75 @@ async def retrieve_policy(request: PolicyRequest):
         )
         
     except Exception as e:
+        log_thread(thread_id, f"❌ Exception occurred: {str(e)}")
+        # Update thread status
+        with browser_threads_lock:
+            if thread_id in browser_threads:
+                browser_threads[thread_id]["status"] = "error"
+                browser_threads[thread_id]["error"] = str(e)
         if driver:
             try:
                 driver.quit()
             except:
                 pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred: {str(e)}"
+        )
+
+
+@app.post("/start")
+async def retrieve_policy(request: PolicyRequest):
+    """
+    Main endpoint to start the bot and navigate to policy details page.
+    Runs the automation in a thread pool so multiple browsers can operate concurrently.
+    
+    Args:
+        request: PolicyRequest containing all the request data
+    
+    Returns:
+        dict: Success response with automation results
+    """
+    # Get unique thread ID for this browser instance
+    thread_id = get_next_thread_id()
+    
+    # Update thread status
+    with browser_threads_lock:
+        if thread_id in browser_threads:
+            browser_threads[thread_id]["status"] = "starting"
+            browser_threads[thread_id]["policy_no"] = request.policy_no
+            browser_threads[thread_id]["action_type"] = request.action_type
+    
+    # Log the start of the request with thread ID
+    log_thread(thread_id, "=" * 80)
+    log_thread(thread_id, "🚀 START ENDPOINT HIT - Beginning policy retrieval process")
+    log_thread(thread_id, "=" * 80)
+    log_thread(thread_id, f"📋 Policy Number: {request.policy_no}")
+    log_thread(thread_id, f"👤 Username: {request.username[:3]}***")  # Partial for security
+    log_thread(thread_id, f"🎯 Action Type: {request.action_type}")
+    if "driver" in request.action_type.lower():
+        log_thread(thread_id, f"📅 Effective Date: {request.date_to_add_driver}")
+    else:
+        if request.vehicle_name_to_replace:
+            log_thread(thread_id, f"🚗 Existing Vehicle: {request.vehicle_name_to_replace}")
+        else:
+            log_thread(thread_id, f"🚗 Existing Vehicle: N/A (Add vehicle)")
+        log_thread(thread_id, f"📅 Effective Date: {request.date_to_rep_vehical}")
+    log_thread(thread_id, "=" * 80)
+    
+    # Run the ENTIRE automation in a thread pool executor
+    # This allows multiple browsers to run concurrently without blocking each other
+    loop = asyncio.get_event_loop()
+    
+    try:
+        # Execute automation in thread pool - each browser runs independently
+        result = await loop.run_in_executor(None, run_automation_sync, request, thread_id)
+        return result
+    except HTTPException:
+        # Re-raise HTTP exceptions as-is
+        raise
+    except Exception as e:
+        log_thread(thread_id, f"❌ Outer exception: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred: {str(e)}"
@@ -4517,19 +4818,39 @@ async def send_otp(request: dict):
                 detail="OTP code is required"
             )
         
-        # Store OTP with timestamp
+        # Add OTP to queue for FIFO distribution to browsers
+        with otp_queue_lock:
+            otp_queue.put(str(otp_code))
+            queue_size = otp_queue.qsize()
+        
+        # Check which threads are waiting for OTP
+        waiting_threads = []
+        with browser_threads_lock:
+            for tid, info in browser_threads.items():
+                if info.get("status") in ["waiting_for_otp", "browser_initialized"]:
+                    waiting_threads.append(tid)
+        
+        # Also store in legacy global storage for backward compatibility
         otp_storage["otp"] = str(otp_code)
         otp_storage["timestamp"] = time.time()
         
-        print(f"✅ OTP received via API: {otp_code}")
-        print(f"⏱️  OTP endpoint processing complete")
-        
-        return {
+        # Return response immediately - don't wait for anything
+        response_data = {
             "success": True,
             "message": "OTP received successfully",
             "otp": otp_code,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
+        
+        # Log after preparing response to minimize blocking
+        print(f"✅ OTP received via API: {otp_code}")
+        print(f"📬 OTP added to queue (queue size: {queue_size}, waiting threads: {waiting_threads})")
+        if waiting_threads:
+            print(f"📋 Next OTP will go to Thread-{waiting_threads[0]} (FIFO order)")
+        print(f"⏱️  OTP endpoint processing complete")
+        
+        # Return immediately - this endpoint should be fast
+        return response_data
         
     except Exception as e:
         print(f"❌ Error in OTP endpoint: {e}")
