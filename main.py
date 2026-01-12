@@ -5187,17 +5187,42 @@ async def send_otp(request: dict):
                 detail="OTP code is required"
             )
         
+        # Check if there are any active sessions (threads running or waiting)
+        # Active statuses indicate a session is running or will need OTP
+        active_statuses = ["initializing", "starting", "browser_initialized", "waiting_for_otp"]
+        active_threads = []
+        waiting_threads = []
+        
+        with browser_threads_lock:
+            for tid, info in browser_threads.items():
+                status = info.get("status", "")
+                if status in active_statuses:
+                    active_threads.append(tid)
+                    if status in ["waiting_for_otp", "browser_initialized"]:
+                        waiting_threads.append(tid)
+        
+        # Only add OTP to queue if there are active sessions
+        # Ignore OTPs that arrive when no session is running to prevent wrong OTPs being used later
+        if not active_threads:
+            print(f"✅ OTP received via API: {otp_code}")
+            print(f"⚠️  OTP IGNORED - No active sessions running (no process threads or Chrome sessions)")
+            print(f"   OTP will only be accepted when a session is actively running or waiting")
+            print(f"⏱️  OTP endpoint processing complete")
+            
+            # Return success response but don't add to queue
+            return {
+                "success": True,
+                "message": "OTP received but ignored - no active sessions",
+                "otp": otp_code,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "ignored": True,
+                "reason": "No active browser sessions running"
+            }
+        
         # Add OTP to queue for FIFO distribution to browsers
         with otp_queue_lock:
             otp_queue.put(str(otp_code))
             queue_size = otp_queue.qsize()
-        
-        # Check which threads are waiting for OTP
-        waiting_threads = []
-        with browser_threads_lock:
-            for tid, info in browser_threads.items():
-                if info.get("status") in ["waiting_for_otp", "browser_initialized"]:
-                    waiting_threads.append(tid)
         
         # Also store in legacy global storage for backward compatibility
         otp_storage["otp"] = str(otp_code)
